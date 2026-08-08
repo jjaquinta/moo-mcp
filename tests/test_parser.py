@@ -1,7 +1,10 @@
 """Unit tests for moo_mcp.parser - covers literal types, nested structures,
 strings with embedded punctuation, and traceback parsing."""
 
+import pytest
+
 from moo_mcp.parser import parse_response
+from moo_mcp.tools.eval import eval_expression
 
 
 def test_int_zero():
@@ -112,3 +115,27 @@ def test_error_property_not_found():
 def test_error_constant_e_propnf():
     val, _ = parse_response("=> E_PROPNF")
     assert val == "E_PROPNF"
+
+
+class _CaptureConn:
+    def __init__(self):
+        self.seen = []
+
+    async def send(self, command: str, *, timeout: float | None = None) -> str:
+        self.seen.append(command)
+        return "=> 0"
+
+
+@pytest.mark.asyncio
+async def test_eval_expression_single_value_uses_return_wrapper():
+    conn = _CaptureConn()
+    await eval_expression(conn, "2 + 2")
+    assert conn.seen == [";return 2 + 2"]
+
+
+@pytest.mark.asyncio
+async def test_eval_expression_block_code_goes_out_raw():
+    conn = _CaptureConn()
+    block = "x = 1;\nwhile (x < 3) {\n    x = x + 1;\n}\nx;"
+    await eval_expression(conn, block)
+    assert conn.seen == [f";{block}"]
