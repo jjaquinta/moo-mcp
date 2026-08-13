@@ -5,6 +5,7 @@ Exposes the moo_mcp.tools.* implementations as MCP tools over stdio.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from contextlib import asynccontextmanager
@@ -12,7 +13,9 @@ from typing import Any
 
 from mcp.server.fastmcp import Context, FastMCP
 
+from moo_mcp import identity
 from moo_mcp.connection import MOOConfig, MOOConnection
+from moo_mcp.tools import command as t_command
 from moo_mcp.tools import eval as t_eval
 from moo_mcp.tools import inspect as t_inspect
 from moo_mcp.tools import props as t_props
@@ -29,10 +32,18 @@ async def _lifespan(_app):
     conn = MOOConnection(cfg)
     await conn.connect()
     logger.info("moo-mcp ready (connected to %s:%s as %s)", cfg.host, cfg.port, cfg.user)
+    identities: dict[str, MOOConnection] = {cfg.user.lower(): conn}
+    identities_lock = asyncio.Lock()
     try:
-        yield {"conn": conn}
+        yield {
+            "conn": conn,
+            "identities": identities,
+            "identities_lock": identities_lock,
+            "primary_config": cfg,
+        }
     finally:
-        await conn.close()
+        for identity_conn in identities.values():
+            await identity_conn.close()
 
 
 app = FastMCP("moo-mcp", lifespan=_lifespan)
@@ -50,6 +61,46 @@ async def eval_moo(expression: str, ctx: Context) -> dict[str, Any]:
     value is null. Use for ad-hoc probes when no higher-level tool fits.
     """
     return await t_eval.eval_expression(_conn(ctx), expression)
+
+
+@app.tool()
+async def send_command(
+    commands: list[str],
+    ctx: Context,
+    as_player: str | None = None,
+    idle: float = 1.0,
+    max_wait: float = 8.0,
+) -> dict[str, Any]:
+    """Inject literal top-level game command(s) - NOT eval - and capture
+    whatever text comes back before the connection goes quiet.
+
+    Unlike eval_moo, this reproduces real command dispatch: caller_perms()
+    is #-1 and dobjstr/prepstr/iobjstr are populated the way they are for an
+    actual player typing a command, neither of which eval can ever produce.
+    Output capture is best-effort (idle-timeout based, not marker-delimited
+    like eval_moo) since real command output isn't self-delimiting - it may
+    include unrelated broadcast/forked-task output that happens to arrive in
+    the same window. Does not auto-retry on connection failure (unlike other
+    tools), since retrying a real command risks double-executing it.
+
+    Each entry in `commands` is one discrete command, sent in order with a
+    short pacing gap between entries. An entry containing embedded newlines
+    is written as multiple physical lines with no gap between them, for
+    interactions the MOO expects as continuous multi-line input (e.g. an
+    @edit/note-composition block).
+
+    as_player: optional pre-configured alternate identity (see README for
+    MOO_USER_<NAME>/MOO_PASS_<NAME> setup). Only identities the operator has
+    already configured via env vars are usable - never pass a password here.
+    """
+    target = await identity.resolve_identity_conn(
+        identities=ctx.request_context.lifespan_context["identities"],
+        lock=ctx.request_context.lifespan_context["identities_lock"],
+        primary_config=ctx.request_context.lifespan_context["primary_config"],
+        primary_conn=_conn(ctx),
+        as_player=as_player,
+    )
+    return await t_command.send_command(target, commands, idle=idle, max_wait=max_wait)
 
 
 @app.tool()
