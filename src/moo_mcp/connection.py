@@ -13,9 +13,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import secrets
 import ssl
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +37,16 @@ class MOOLoginFailed(MOOError):
     """Raised when the post-login verification round-trip fails."""
 
 
+# Best-effort phrases seen in stock LambdaMOO cores' rejection of a bad
+# `connect <user> <pass>`. Used only for identities that can't be eval-
+# verified (see MOOConfig.for_identity / MOOConnection._check_banner_for_login_failure).
+# A custom core's wording may differ - this is a heuristic, not a guarantee.
+_LOGIN_REJECTION_PHRASES = (
+    "does not exist, or has a different password",
+    "you may not log in",
+)
+
+
 @dataclass
 class MOOConfig:
     host: str
@@ -47,6 +58,15 @@ class MOOConfig:
     banner_wait: float = 0.8
     tls: bool = False
     tls_insecure: bool = False
+    verify_login: bool = True
+
+    @staticmethod
+    def _validate_credential(label: str, value: str) -> None:
+        # SECURITY: user/password get spliced into a `connect <user> <pass>\r\n`
+        # TCP frame. CR/LF in either would let a malicious env-var value inject
+        # additional commands. Reject at config load.
+        if "\r" in value or "\n" in value or "\x00" in value:
+            raise MOOError(f"{label} must not contain CR, LF, or NUL bytes")
 
     @classmethod
     def from_env(cls) -> MOOConfig:
@@ -55,12 +75,8 @@ class MOOConfig:
             raise MOOError(f"missing required env vars: {', '.join(missing)}")
         user = os.environ["MOO_USER"]
         password = os.environ["MOO_PASS"]
-        # SECURITY: user/password get spliced into a `connect <user> <pass>\r\n`
-        # TCP frame. CR/LF in either would let a malicious env-var value inject
-        # additional commands. Reject at config load.
-        for label, val in (("MOO_USER", user), ("MOO_PASS", password)):
-            if "\r" in val or "\n" in val or "\x00" in val:
-                raise MOOError(f"{label} must not contain CR, LF, or NUL bytes")
+        cls._validate_credential("MOO_USER", user)
+        cls._validate_credential("MOO_PASS", password)
         return cls(
             host=os.environ["MOO_HOST"],
             port=int(os.environ["MOO_PORT"]),
@@ -71,6 +87,34 @@ class MOOConfig:
             tls=os.environ.get("MOO_TLS", "false").lower() == "true",
             tls_insecure=os.environ.get("MOO_TLS_INSECURE", "false").lower() == "true",
         )
+
+    @classmethod
+    def for_identity(cls, primary: MOOConfig, identity: str) -> MOOConfig:
+        """Build a config for a secondary player identity.
+
+        Credentials come from `MOO_USER_<KEY>`/`MOO_PASS_<KEY>` env vars, where
+        `KEY` is `identity` uppercased with any character outside
+        `[A-Za-z0-9_]` replaced by `_`. Everything else (host/port/timeout/
+        reconnect/banner_wait/tls/tls_insecure) is inherited from `primary`.
+
+        `verify_login` is set to False: unlike the primary (wizard) identity,
+        we can't assume a secondary player has programmer permissions, so the
+        eval-based login round-trip in `MOOConnection.connect()` isn't
+        available for it - see `MOOConnection._check_banner_for_login_failure`
+        for the (weaker, heuristic) substitute used instead.
+        """
+        key = re.sub(r"[^A-Za-z0-9_]", "_", identity.strip()).upper()
+        user_var, pass_var = f"MOO_USER_{key}", f"MOO_PASS_{key}"
+        user = os.environ.get(user_var)
+        password = os.environ.get(pass_var)
+        if not user or not password:
+            raise MOOError(
+                f"no credentials configured for identity {identity!r}: "
+                f"set {user_var}, {pass_var}"
+            )
+        cls._validate_credential(user_var, user)
+        cls._validate_credential(pass_var, password)
+        return replace(primary, user=user, password=password, verify_login=False)
 
     def build_ssl_context(self) -> ssl.SSLContext | None:
         """Build an SSL context for the connection, or None if TLS is disabled.
@@ -121,13 +165,16 @@ class MOOConnection:
         self._writer.write(login_cmd)
         await self._writer.drain()
         await asyncio.sleep(self.config.banner_wait)
-        self._drain_queue()
+        banner_lines = self._drain_queue()
         self._connected = True
-        token = secrets.token_hex(4)
-        result = await self._send_locked(f';return "moo-mcp-login-{token}"')
-        if f"moo-mcp-login-{token}" not in result:
-            self._connected = False
-            raise MOOLoginFailed(f"login verification did not echo back; got: {result!r}")
+        if self.config.verify_login:
+            token = secrets.token_hex(4)
+            result = await self._send_locked(f';return "moo-mcp-login-{token}"')
+            if f"moo-mcp-login-{token}" not in result:
+                self._connected = False
+                raise MOOLoginFailed(f"login verification did not echo back; got: {result!r}")
+        else:
+            self._check_banner_for_login_failure(banner_lines)
         logger.info("connected as %s", self.config.user)
 
     async def close(self) -> None:
@@ -167,12 +214,30 @@ class MOOConnection:
             await self._lines.put(text)
         self._connected = False
 
-    def _drain_queue(self) -> None:
+    def _drain_queue(self) -> list[str]:
+        drained: list[str] = []
         while not self._lines.empty():
             try:
-                self._lines.get_nowait()
+                drained.append(self._lines.get_nowait())
             except asyncio.QueueEmpty:
-                return
+                break
+        return drained
+
+    def _check_banner_for_login_failure(self, lines: list[str]) -> None:
+        """Best-effort, non-eval login check for identities we can't verify via
+        eval (see MOOConfig.for_identity). This is a heuristic scan for known
+        LambdaMOO rejection phrasing - NOT authoritative. Absence of a known
+        rejection phrase is not proof of a successful login, especially on a
+        core with custom reject wording.
+        """
+        joined = "\n".join(lines).lower()
+        for phrase in _LOGIN_REJECTION_PHRASES:
+            if phrase in joined:
+                self._connected = False
+                raise MOOLoginFailed(
+                    f"login for {self.config.user!r} appears rejected "
+                    f"(matched {phrase!r}): {joined!r}"
+                )
 
     async def send(self, command: str, *, timeout: float | None = None) -> str:
         """Send a command (or multi-line block) and return the response between markers.
@@ -229,3 +294,66 @@ class MOOConnection:
         except TimeoutError as exc:
             raise MOOTimeout(f"no response to end-marker within {wait}s") from exc
         return "\n".join(captured)
+
+    async def send_raw(
+        self,
+        commands: list[str],
+        *,
+        idle: float = 1.0,
+        max_wait: float = 8.0,
+        inter_command_delay: float = 0.2,
+    ) -> str:
+        """Write literal top-level command(s) and capture whatever comes back.
+
+        Unlike `send()`, this does NOT wrap `commands` in eval markers - it's
+        for injecting real player commands (see moo_mcp.tools.command), which
+        aren't self-delimiting the way eval's `;"token"` echo is. Output is
+        captured via idle-timeout (see `drain_idle`) rather than an exact
+        end-marker match.
+
+        Each entry in `commands` is one discrete top-level interaction, sent
+        with `inter_command_delay` between entries. An entry containing
+        embedded newlines is written as multiple physical lines back-to-back
+        with no delay between them, since it's one logical interaction (e.g.
+        a multi-line `@edit`/note-composition block the MOO expects as
+        continuous input).
+
+        Deliberately does NOT retry on connection failure the way `send()`
+        does: a real command retried after a flaky connection could
+        double-execute a side-effecting action.
+        """
+        async with self._lock:
+            if not self._connected:
+                if self.config.reconnect:
+                    await self._reconnect()
+                else:
+                    raise MOONotConnected("not connected and reconnect disabled")
+            if not self._writer:
+                raise MOONotConnected("writer is None")
+            self._drain_queue()  # flush stray unsolicited output before this call's window
+            for i, cmd in enumerate(commands):
+                for line in cmd.splitlines() or [cmd]:
+                    self._writer.write(f"{line}\r\n".encode())
+                    await self._writer.drain()
+                if i < len(commands) - 1:
+                    await asyncio.sleep(inter_command_delay)
+            lines = await drain_idle(self._lines, idle=idle, max_wait=max_wait)
+            return "\n".join(lines)
+
+
+async def drain_idle(queue: asyncio.Queue[str], *, idle: float, max_wait: float) -> list[str]:
+    """Collect items from `queue` until either `idle` seconds pass with
+    nothing new, or `max_wait` total seconds elapse, whichever comes first.
+    """
+    collected: list[str] = []
+    loop = asyncio.get_event_loop()
+    deadline = loop.time() + max_wait
+    while True:
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            break
+        try:
+            collected.append(await asyncio.wait_for(queue.get(), timeout=min(idle, remaining)))
+        except TimeoutError:
+            break
+    return collected

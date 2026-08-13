@@ -40,6 +40,7 @@ pip install -e .
 | `MOO_RECONNECT` | no | `true`/`false`, auto-reconnect on drop (default `true`) |
 | `MOO_TLS` | no | `true`/`false`, wrap the connection in TLS (default `false`). Use this when the MOO is fronted by stunnel or otherwise serves the admin port over TLS. |
 | `MOO_TLS_INSECURE` | no | `true`/`false`, skip TLS certificate validation (default `false`). Only enable for self-signed certs on a MOO you control. |
+| `MOO_USER_<NAME>` / `MOO_PASS_<NAME>` | no | Credentials for an alternate player identity, usable via `send_command(as_player="<name>")`. `<NAME>` is matched case-insensitively against `as_player`. Never pass a password through a tool call - only identities pre-configured this way are usable. |
 
 ## Use with Claude Code
 
@@ -73,6 +74,7 @@ MOO_HOST=... MOO_PORT=... MOO_USER=... MOO_PASS=... python -m moo_mcp
 | Tool | Description |
 |---|---|
 | `eval` | Evaluate a MOO expression; returns parsed value or structured error |
+| `send_command` | Inject a literal top-level command (not eval), optionally as an alternate identity; best-effort idle-timeout capture |
 | `list_verb` | Read a verb body; returns header + numbered lines |
 | `program_verb` | Replace a verb body; **auto-verifies** by re-listing and diffing |
 | `add_verb` / `remove_verb` / `chmod_verb` | Verb lifecycle |
@@ -94,7 +96,9 @@ Specific notes:
 - **`program_verb` rejects bare-dot lines** in the body (they would terminate the `@program` block and let the rest land in the command parser). If you need a literal `.` line in MOO code, indent it.
 - **`add_verb` validates the verb arg-spec** (`dobj` / `iobj` must be `this`/`any`/`none`, `prep` is allowlist-character-checked) to prevent breaking out of the MOO double-quoted literal during eval splice.
 - **`set_property` / `add_property` value serializer** escapes backslashes, double quotes, carriage returns, line feeds, and NUL bytes in string values so a malicious property value cannot break out of the MOO source.
-- **Connection config rejects CR/LF/NUL in `MOO_USER` / `MOO_PASS`** to prevent command injection at login time.
+- **Connection config rejects CR/LF/NUL in `MOO_USER` / `MOO_PASS`** (and `MOO_USER_<NAME>` / `MOO_PASS_<NAME>`) to prevent command injection at login time.
+- **`send_command` bypasses `eval_moo`'s marker-delimited framing entirely.** Real command output isn't self-delimiting, so capture is a best-effort idle-timeout heuristic - it can include unrelated broadcast/forked-task output that happens to arrive in the same window, and it does not auto-retry on connection failure (unlike other tools), since retrying a real command risks double-executing it.
+- **`as_player` identities are allowlisted by construction.** They're resolved server-side from `MOO_USER_<NAME>`/`MOO_PASS_<NAME>` env vars only - a client can select among identities the operator pre-configured, never supply new credentials through a tool call. Secondary-identity logins are **not** eval-verified like the primary connection (we can't assume a non-wizard player has programmer permissions) - only a heuristic scan of the login banner for known rejection phrasing, which is weaker than the primary's verified login and may miss a rejection on a non-stock core.
 - **`search_verbs` accepts user-provided regex.** A pathological pattern can cause catastrophic backtracking. Python's `re` has no built-in timeout. Trust the caller, or pre-validate patterns if you're exposing this to untrusted input.
 - **No persistent state**: no on-disk caching, no logging of passwords, no telemetry. Connection credentials live only in env vars; in-flight commands live in process memory.
 
