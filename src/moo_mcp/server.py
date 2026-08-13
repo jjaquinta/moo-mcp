@@ -14,6 +14,7 @@ from mcp.server.fastmcp import Context, FastMCP
 
 from moo_mcp.connection import MOOConfig, MOOConnection
 from moo_mcp.tools import eval as t_eval
+from moo_mcp.tools import export as t_export
 from moo_mcp.tools import inspect as t_inspect
 from moo_mcp.tools import props as t_props
 from moo_mcp.tools import search as t_search
@@ -211,6 +212,23 @@ async def search_verbs(
         case_insensitive=case_insensitive,
         max_results=max_results,
     )
+
+
+@app.tool()
+async def export_object(object: str, ctx: Context) -> dict[str, Any]:
+    """Export full-fidelity object state in one call.
+
+    Returns the `@dump` output plus structured components:
+    - raw: literal @dump output (for archival, diffs)
+    - object_id: parsed object reference (#123 or $name)
+    - properties: {name: {value, owner, perms}} for locally-defined properties
+    - verbs: [{name, dobj, prep, iobj, owner, perms, lines}] for locally-defined verbs
+
+    This replaces the need for ~19 round-trip tool calls (list properties, list each
+    property value, list verbs, list each verb body). Single-call access to full object
+    fidelity.
+    """
+    return await t_export.export_object(_conn(ctx), object)
 
 
 def main() -> None:

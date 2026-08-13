@@ -17,6 +17,7 @@ import sys
 
 from moo_mcp.connection import MOOConfig, MOOConnection
 from moo_mcp.tools import eval as t_eval
+from moo_mcp.tools import export as t_export
 from moo_mcp.tools import inspect as t_inspect
 from moo_mcp.tools import props as t_props
 from moo_mcp.tools import topology as t_topo
@@ -54,6 +55,8 @@ async def main() -> int:
 
         # Inspect the .name property's inheritance chain to exercise the new tool.
         show(f"inspect_property {target}.name", await t_inspect.inspect_property(conn, target, "name", max_depth=10))
+
+        show(f"export_object {target}", await t_export.export_object(conn, target))
 
         show("eval missing prop (error)", await t_eval.eval_expression(conn, f"{target}.nonexistent_xyz"))
     finally:
