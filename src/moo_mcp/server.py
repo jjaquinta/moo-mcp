@@ -58,6 +58,12 @@ def _conn(ctx: Context) -> MOOConnection:
 async def eval_moo(expression: str, ctx: Context) -> dict[str, Any]:
     """Evaluate a MOO expression (without leading `;`).
 
+    Multi-statement/block input (e.g. `a = 5; return a * 2;`) runs correctly
+    as a whole program - it's routed through the eval() builtin rather than
+    sent as a single raw admin-port line, since the raw line form silently
+    truncates at the first statement on this server. Value is 0 if the code
+    never hits a `return`.
+
     Returns {value, raw, error?}. On a MOO traceback, error is populated and
     value is null. Use for ad-hoc probes when no higher-level tool fits.
     """
