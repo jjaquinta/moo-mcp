@@ -118,12 +118,13 @@ def test_error_constant_e_propnf():
 
 
 class _CaptureConn:
-    def __init__(self):
+    def __init__(self, response: str = "=> 0"):
         self.seen = []
+        self._response = response
 
     async def send(self, command: str, *, timeout: float | None = None) -> str:
         self.seen.append(command)
-        return "=> 0"
+        return self._response
 
 
 @pytest.mark.asyncio
@@ -134,8 +135,28 @@ async def test_eval_expression_single_value_uses_return_wrapper():
 
 
 @pytest.mark.asyncio
-async def test_eval_expression_block_code_goes_out_raw():
-    conn = _CaptureConn()
+async def test_eval_expression_block_code_routes_through_eval_builtin():
+    # Regression test for Issue #6: this server's interactive `;` command
+    # silently truncates multi-statement input at the first statement, so
+    # block-shaped payloads must go through the eval() builtin instead of
+    # being sent as a raw `;<code>` line.
+    conn = _CaptureConn(response='=> {1, 3}')
     block = "x = 1;\nwhile (x < 3) {\n    x = x + 1;\n}\nx;"
-    await eval_expression(conn, block)
-    assert conn.seen == [f";{block}"]
+    from moo_mcp.tools.eval import _moo_string_literal
+
+    result = await eval_expression(conn, block)
+    assert conn.seen == [f";return eval({_moo_string_literal(block)})"]
+    assert result == {"value": 3, "raw": '=> {1, 3}'}
+
+
+@pytest.mark.asyncio
+async def test_eval_expression_explicit_leading_semicolon_block_also_fixed():
+    # The original bug report's raw-protocol repro included a leading `;`
+    # (`; trek_player = create(#-1); ...`) - that must be fixed the same way
+    # as the unprefixed form used in the reopening retest.
+    conn = _CaptureConn(response='=> {1, 10}')
+    from moo_mcp.tools.eval import _moo_string_literal
+
+    result = await eval_expression(conn, "; a = 5; return a * 2;")
+    assert conn.seen == [f';return eval({_moo_string_literal("a = 5; return a * 2;")})']
+    assert result["value"] == 10
